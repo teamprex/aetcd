@@ -14,6 +14,9 @@ from . import utils
 from . import watcher
 
 
+MAX_COUNT_TO_WAIT_CONNECT_CHECK = 3
+
+
 def _handle_errors(f):
     if inspect.iscoroutinefunction(f):
         async def handler(*args, **kwargs):
@@ -165,16 +168,24 @@ class Client:
     @_handle_errors
     async def connect(self) -> None:
         """Establish a connection to an etcd."""
-        if self._connected.is_set():
-            return
+        for _ in range(MAX_COUNT_TO_WAIT_CONNECT_CHECK):
+            if self._connected.is_set():
+                return
 
-        if self._is_connecting:
-            # Another task is establishing a connection, just wait
-            await asyncio.wait_for(
-                self._connected.wait(),
-                self._connect_wait_timeout,
-            )
-            return
+            try:
+                if self._is_connecting:
+                    # Another task is establishing a connection. Just wait.
+                    await asyncio.wait_for(
+                        self._connected.wait(),
+                        self._connection_check_timeout,
+                    )
+                    return
+                break
+            except asyncio.TimeoutError:
+                # Another task fails to connect. Try again
+                continue
+        else:
+            raise asyncio.TimeoutError()
 
         try:
             self._is_connecting = True
@@ -211,14 +222,25 @@ class Client:
     async def close(self) -> None:
         """Close established connection and frees allocated resources.
 
-        It could be called while other operation is being executed.
+        NOTE: It could be called while other operation is being executed.
+              At that time, the executing operation will be broken.
         """
-        if not self._connected.is_set() and self._is_connecting:
-            # Wait for the previous request to complete
-            await asyncio.wait_for(
-                self._connected.wait(),
-                self._connect_wait_timeout,
-            )
+        for _ in range(MAX_COUNT_TO_WAIT_CONNECT_CHECK):
+            if not self._connected.is_set() and self._is_connecting:
+                # connect() is waiting for the response of Authenticate() in
+                # another task.
+                # Wait for connect() is done to keep consistency
+                try:
+                    await asyncio.wait_for(
+                        self._connected.wait(),
+                        self._connection_check_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    # Another task fails to connect. Check again
+                    continue
+            break
+        else:
+            raise asyncio.TimeoutError()
 
         if self.channel:
             # Shutdown the watcher
@@ -240,6 +262,20 @@ class Client:
 
     async def __aexit__(self, *args):
         await self.close()
+
+    @_handle_errors
+    @_ensure_connected
+    async def reset_auth_token(self) -> None:
+        cred_params = [c is not None for c in (self._username, self._password)]
+        if all(cred_params):
+            auth_request = rpc.AuthenticateRequest(
+                name=self._username,
+                password=self._password,
+            )
+            resp = await self.auth_stub.Authenticate(auth_request, timeout=self._timeout)
+            metadata = (('token', resp.token),)
+            self.metadata = metadata
+            self._watcher._metadata = metadata
 
     @_handle_errors
     @_ensure_connected
