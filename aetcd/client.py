@@ -177,7 +177,7 @@ class Client:
                     # Another task is establishing a connection. Just wait.
                     await asyncio.wait_for(
                         self._connected.wait(),
-                        self._connection_check_timeout,
+                        self._connect_wait_timeout,
                     )
                     return
                 break
@@ -233,7 +233,7 @@ class Client:
                 try:
                     await asyncio.wait_for(
                         self._connected.wait(),
-                        self._connection_check_timeout,
+                        self._connect_wait_timeout,
                     )
                 except asyncio.TimeoutError:
                     # Another task fails to connect. Check again
